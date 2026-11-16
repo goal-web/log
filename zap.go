@@ -58,38 +58,44 @@ func (z *zapLogger) Log(level contracts.LogLevel, msg string) {
 }
 
 // WithFields 添加一组字段，返回携带新字段的独立实例（zap.Logger.With 不可变语义）。
+// 派生实例携带同一 core，保证 stack 组合取 core 时不会拿到 nil。
 // WithFields adds fields and returns an independent instance carrying them
-// (zap.Logger.With immutability semantics).
+// (zap.Logger.With immutability semantics). Derived instances keep the same
+// core so stack composition never reads a nil one.
 func (z *zapLogger) WithFields(fields contracts.Fields) contracts.Logger {
 	next := z.l
 	for key, value := range fields {
 		next = next.With(zap.Any(key, value))
 	}
 
-	return &zapLogger{l: next}
+	return &zapLogger{core: z.core, l: next}
 }
 
-// WithField 通过给定的 key value 添加数据。
-// WithField adds data by the given key and value.
+// WithField 通过给定的 key value 添加数据。派生实例携带同一 core（见 WithFields）。
+// WithField adds data by the given key and value. Derived instances keep the
+// same core (see WithFields).
 func (z *zapLogger) WithField(key string, value any) contracts.Logger {
-	return &zapLogger{l: z.l.With(zap.Any(key, value))}
+	return &zapLogger{core: z.core, l: z.l.With(zap.Any(key, value))}
 }
 
-// WithError 添加错误（字段名为 "error"）。
-// WithError adds an error under the "error" field key.
+// WithError 添加错误（字段名为 "error"）。派生实例携带同一 core（见 WithFields）。
+// WithError adds an error under the "error" field key. Derived instances keep
+// the same core (see WithFields).
 func (z *zapLogger) WithError(err error) contracts.Logger {
-	return &zapLogger{l: z.l.With(zap.Error(err))}
+	return &zapLogger{core: z.core, l: z.l.With(zap.Error(err))}
 }
 
 // WithException 记录异常及其 previous 链（对齐旧 apex 适配的 error + previous 行为）。
+// 派生实例携带同一 core（见 WithFields）。
 // WithException records the exception and its previous chain
-// (aligned with the legacy apex adapter's error + previous behavior).
+// (aligned with the legacy apex adapter's error + previous behavior). Derived
+// instances keep the same core (see WithFields).
 func (z *zapLogger) WithException(exception contracts.Exception) contracts.Logger {
 	if exception == nil {
 		return z
 	}
 
-	return &zapLogger{l: z.l.With(
+	return &zapLogger{core: z.core, l: z.l.With(
 		zap.Error(exception),
 		zap.Any("previous", exception.GetPrevious()),
 	)}

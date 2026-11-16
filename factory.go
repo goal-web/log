@@ -47,7 +47,14 @@ type Factory struct {
 	drivers  map[string]contracts.LogDriver
 	channels map[string]contracts.ChannelLogger
 	builds   map[string]*channelBuild
-	mutex    sync.Mutex
+	// stackClosure 是每个通道经静态 stack 依赖边可达的通道集合（含自身），
+	// NewFactory 时从配置一次性算出（配置此后不可变），供并发构建的死锁判定。
+	// stackClosure is the set of channels reachable from each channel over the
+	// static stack dependency edges (including itself), computed once from the
+	// configuration at NewFactory (the config is immutable afterwards) for the
+	// concurrent-build deadlock check.
+	stackClosure map[string]map[string]bool
+	mutex        sync.Mutex
 }
 
 // NewFactory 用给定配置创建 LogManager。配置完全为空（无默认通道且无通道表）
@@ -71,10 +78,11 @@ func NewFactory(config Config) contracts.LogManager {
 	}
 
 	return &Factory{
-		config:   config,
-		drivers:  newBuiltinDrivers(),
-		channels: map[string]contracts.ChannelLogger{},
-		builds:   map[string]*channelBuild{},
+		config:       config,
+		drivers:      newBuiltinDrivers(),
+		channels:     map[string]contracts.ChannelLogger{},
+		builds:       map[string]*channelBuild{},
+		stackClosure: buildStackClosure(config.Channels),
 	}
 }
 
@@ -228,6 +236,12 @@ func (f *Factory) buildChannel(channelName string, chain map[string]bool) contra
 //   - 子通道命中 chain：循环引用错误；
 //   - 子通道产物不是 zap 适配实现：无法参与 NewTee 组合，配置错误。
 //
+// channels 列表中的重复子通道不去重：同一子通道的 core 会在 tee 中出现多次，
+// 同一条日志向该子通道重复写入（双写），按配置语义直译，不做特殊处理。
+// Duplicate child names in channels are not deduplicated: the same child's
+// core appears in the tee multiple times and one record is written to it
+// repeatedly (double-write) — taken literally from the configuration.
+//
 // buildStackChannel composes a stack channel: it parses the channels child
 // names, builds each one recursively (children reuse the manager's cache and
 // build pipeline), collects every child's zapcore.Core, fans out with
@@ -378,6 +392,70 @@ func stackChildNames(channelName string, cfg contracts.Fields) ([]string, error)
 			channelName, raw, channelName, raw,
 		)
 	}
+}
+
+// buildStackClosure 计算每个通道经静态 stack 依赖边可达的通道集合（含自身）：
+// 从 NewFactory 的配置出发迭代到不动点（子通道引用按 stackChildNames 解析，
+// 非法配置按无子通道处理，运行时自会兜底）。不动点天然覆盖静态环（SCC 成员
+// 互相可达），终止性由单调增长 + 有限通道集保证。仅 stack 驱动产生依赖边；
+// 驱动构建期间的重入（见 Extend 注释）不在此列。
+// buildStackClosure computes the set of channels reachable from each channel
+// over the static stack dependency edges (including itself): it iterates from
+// the NewFactory configuration to a fixpoint (child references are parsed via
+// stackChildNames; an invalid config counts as no children — the runtime falls
+// back anyway). The fixpoint naturally covers static cycles (SCC members reach
+// each other) and terminates because the sets grow monotonically over a finite
+// channel universe. Only the stack driver produces edges; re-entrant calls
+// made by drivers during their build are not covered (see Extend).
+func buildStackClosure(channels map[string]contracts.Fields) map[string]map[string]bool {
+	closures := make(map[string]map[string]bool, len(channels))
+	for name := range channels {
+		closures[name] = map[string]bool{name: true}
+	}
+
+	childrenOf := make(map[string][]string, len(channels))
+	for name, cfg := range channels {
+		if driverName, _ := cfg[KeyDriver].(string); driverName == driverStack {
+			if children, err := stackChildNames(name, cfg); err == nil {
+				childrenOf[name] = children
+			}
+		}
+	}
+
+	for changed := true; changed; {
+		changed = false
+		for name, children := range childrenOf {
+			for _, child := range children {
+				for reachable := range closures[child] {
+					if !closures[name][reachable] {
+						closures[name][reachable] = true
+						changed = true
+					}
+				}
+			}
+		}
+	}
+
+	return closures
+}
+
+// stackClosureIntersects 判断正在构建的通道按静态闭包是否可能回归到 chain 中
+// 的某个祖先通道（即调用方 goroutine 当前持有的构建登记）：相交即可能与祖先
+// 所在 goroutine 形成互等死锁，调用方必须私有构建。
+// stackClosureIntersects reports whether the channel being built could reach
+// back to an ancestor in chain per the static closure (i.e. a build
+// registration the caller's goroutine currently holds): an intersection means
+// the two goroutines could wait on each other forever, so the caller must
+// build privately.
+func (f *Factory) stackClosureIntersects(channelName string, chain map[string]bool) bool {
+	closure := f.stackClosure[channelName]
+	for name := range chain {
+		if closure[name] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // finalizeChannel 完成通道构建的收尾：注入通道名（zap 适配实现写入 encoder

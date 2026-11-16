@@ -2,10 +2,12 @@ package tests
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/goal-web/contracts"
 	"github.com/goal-web/log"
@@ -471,3 +473,255 @@ func (f *fakePlainLogger) WithException(exception contracts.Exception) contracts
 // 编译期锁定 fakePlainLogger 仅实现 contracts.Logger（不含 Log）。
 // Compile-time lock that fakePlainLogger implements only contracts.Logger.
 var _ contracts.Logger = (*fakePlainLogger)(nil)
+
+// TestDriverPanicFallsBackAndRecovers 锁定 panic 撤销状态机：认领方在驱动中
+// panic 后，构建登记被撤销、等待方被放行拿到可用兜底 logger（不卡死），随后
+// 的调用重新构建成功（旧的全锁实现 panic 后可直接重建，语义不得劣化）。
+// TestDriverPanicFallsBackAndRecovers locks the panic retraction state machine:
+// after the claimant panics inside the driver, the build registration is
+// retracted, the waiter is released with a usable fallback logger (never
+// wedged), and a later call rebuilds successfully (the old full-lock design
+// rebuilt right after a panic, so that property must not regress).
+func TestDriverPanicFallsBackAndRecovers(t *testing.T) {
+	buf := &bytes.Buffer{}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var builds int32
+	boom := errors.New("driver boom")
+
+	mgr := log.NewFactory(log.Config{
+		Default: "app",
+		Channels: map[string]contracts.Fields{
+			"app": {log.KeyDriver: "slow", log.KeyWriter: buf, log.KeyLevel: "debug", log.KeyFormat: "console"},
+		},
+	})
+	mgr.Extend("slow", func(name string, cfg contracts.Fields) (contracts.Logger, error) {
+		if atomic.AddInt32(&builds, 1) == 1 {
+			close(started)
+			<-release // 阻塞认领方，让等待方先落到 <-done hold the claimant so the waiter lands on <-done first
+			panic(boom)
+		}
+		return log.NewBufferLogger(cfg)
+	})
+
+	// 认领方：进入驱动后阻塞，放行后 panic（测试内 recover 断言）。
+	// Claimant: blocks inside the driver, panics after release (recovered here).
+	claimed := make(chan any, 1)
+	go func() {
+		defer func() { claimed <- recover() }()
+		mgr.Channel()
+	}()
+	<-started
+
+	// 等待方：此刻构建必然已登记，落入等待路径。
+	// Waiter: the build is registered by now, so it takes the wait path.
+	waited := make(chan contracts.ChannelLogger, 1)
+	go func() { waited <- mgr.Channel() }()
+	time.Sleep(50 * time.Millisecond)
+
+	// 放行 → 认领方 panic → 撤销登记 + 兜底填充 + close(done)。兜底 logger 在
+	// 构建时捕获 stderr，故等待方的放行、兜底 Warn 与可用性断言全部放在同一
+	// 捕获窗口内完成。
+	// Release -> claimant panics -> registration retracted + fallback filled +
+	// close(done). The fallback logger captures stderr at build time, so the
+	// waiter's release, the fallback Warn and the usability check all share one
+	// capture window.
+	var recovered any
+	var fallback contracts.ChannelLogger
+	out := captureStderr(t, func() {
+		close(release)
+		recovered = <-claimed
+
+		select {
+		case fallback = <-waited:
+		case <-time.After(2 * time.Second):
+			t.Error("等待方未在 panic 后被放行（构建登记泄漏）waiter was not released after the panic (registry leak)")
+		}
+
+		if fallback != nil {
+			fallback.Info("after-panic")
+		}
+	})
+
+	assert.Equal(t, boom, recovered, "认领方应收到驱动 panic the claimant must receive the driver panic")
+	assert.NotNil(t, fallback, "等待方应拿到兜底 logger the waiter must receive a fallback logger")
+	assert.Contains(t, out, "WARN", "panic 应触发兜底 Warn the panic must emit the fallback Warn")
+	assert.Contains(t, out, "after-panic", "兜底 logger 应可用 the fallback must stay usable")
+
+	// 撤销登记后第二次调用重建成功。
+	// After the retraction a later call rebuilds successfully.
+	rebuilt := mgr.Channel()
+	assert.NotNil(t, rebuilt)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&builds), "登记已撤销，应重新构建 the registry must have been retracted for a rebuild")
+	rebuilt.Info("rebuilt")
+	assert.Contains(t, buf.String(), "rebuilt")
+}
+
+// TestConcurrentFirstBuildWaitPath 确定性覆盖 singleflight 等待路径：慢驱动
+// 阻塞认领方期间，其余 19 个并发调用方全部落在 <-done 等待上（而非事后缓存
+// 命中），放行后恰好构建 1 次且全同实例。
+// TestConcurrentFirstBuildWaitPath deterministically covers the singleflight
+// wait path: while the slow driver blocks the claimant, the other 19
+// concurrent callers all land on <-done (rather than later cache hits); after
+// release exactly one build happens and every caller shares one instance.
+func TestConcurrentFirstBuildWaitPath(t *testing.T) {
+	buf := &bytes.Buffer{}
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var builds int32
+
+	mgr := log.NewFactory(log.Config{
+		Default: "app",
+		Channels: map[string]contracts.Fields{
+			"app": {log.KeyDriver: "slow", log.KeyWriter: buf, log.KeyLevel: "debug", log.KeyFormat: "console"},
+		},
+	})
+	mgr.Extend("slow", func(name string, cfg contracts.Fields) (contracts.Logger, error) {
+		if atomic.AddInt32(&builds, 1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+		return log.NewBufferLogger(cfg)
+	})
+
+	const callers = 20
+	instances := make([]contracts.ChannelLogger, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(seq int) {
+			defer wg.Done()
+			instances[seq] = mgr.Channel()
+		}(i)
+	}
+	<-entered
+	time.Sleep(100 * time.Millisecond) // 其余调用方进入等待 the other callers reach the wait
+	close(release)
+
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待路径卡死 the wait path deadlocked")
+	}
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&builds), "并发首建至多构建一次 must build at most once")
+	for i := 1; i < callers; i++ {
+		assert.Same(t, instances[0], instances[i], "并发调用应共享同一实例 concurrent callers must share one instance")
+	}
+}
+
+// TestConcurrentStacksShareChildSingleBuild 锁定并发 stack 共享子通道的
+// singleflight 语义：两个 goroutine 并发构建引用同一子通道的两个 stack 时，
+// 子通道恰好构建 1 次（相交链判定下等待共享，而非私有构建产生双实例）。
+// TestConcurrentStacksShareChildSingleBuild locks the singleflight semantics
+// of concurrent stacks sharing a child: two goroutines building two stacks
+// that reference the same child must trigger exactly one child build (the
+// intersecting-chain rule waits and shares instead of privately rebuilding).
+func TestConcurrentStacksShareChildSingleBuild(t *testing.T) {
+	sharedBuf := &bytes.Buffer{}
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var sharedBuilds int32
+
+	mgr := log.NewFactory(log.Config{
+		Default: "p",
+		Channels: map[string]contracts.Fields{
+			"shared": {log.KeyDriver: "slow", log.KeyWriter: sharedBuf, log.KeyLevel: "debug", log.KeyFormat: "console"},
+			"p":      {log.KeyDriver: "stack", log.KeyLevel: "debug", "channels": []string{"shared"}},
+			"q":      {log.KeyDriver: "stack", log.KeyLevel: "debug", "channels": []string{"shared"}},
+		},
+	})
+	mgr.Extend("slow", func(name string, cfg contracts.Fields) (contracts.Logger, error) {
+		if atomic.AddInt32(&sharedBuilds, 1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+		return log.NewBufferLogger(cfg)
+	})
+
+	pDone := make(chan contracts.ChannelLogger, 1)
+	go func() { pDone <- mgr.Channel("p") }()
+	<-entered // p 已认领 shared 并阻塞在驱动里 p has claimed shared and blocks inside the driver
+
+	qDone := make(chan contracts.ChannelLogger, 1)
+	go func() { qDone <- mgr.Channel("q") }()
+	time.Sleep(50 * time.Millisecond) // q 落到等待路径 q reaches the wait path
+
+	close(release)
+
+	select {
+	case p := <-pDone:
+		assert.NotNil(t, p)
+	case <-time.After(2 * time.Second):
+		t.Fatal("p 未完成 p did not finish")
+	}
+	select {
+	case q := <-qDone:
+		assert.NotNil(t, q)
+	case <-time.After(2 * time.Second):
+		t.Fatal("q 未完成（不应私有构建也不应死锁）q did not finish (must neither privately rebuild nor deadlock)")
+	}
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&sharedBuilds), "共享子通道应恰好构建一次 the shared child must build exactly once")
+
+	// 两个 stack 共享同一子通道实例：经各自 tee 写入同一底层 writer。
+	// Both stacks share the same child instance: records reach the shared
+	// writer through each stack's own tee.
+	mgr.Channel("p").Info("from-p")
+	mgr.Channel("q").Info("from-q")
+	out := sharedBuf.String()
+	assert.Contains(t, out, "from-p")
+	assert.Contains(t, out, "from-q")
+}
+
+// TestStackMutualReferenceConcurrentNoDeadlock 锁定 I2 判定方案的关键场景：
+// X⇄Y 互引的两个 stack 被两个 goroutine 并发构建时不得互等死锁（静态闭包
+// 判定识破潜在环，双方私有构建并由 chain 环检测各自兜底 + Warn）。
+// TestStackMutualReferenceConcurrentNoDeadlock locks the key scenario behind
+// the I2 rule: two goroutines concurrently building mutually referencing
+// stacks X and Y must not wait on each other forever (the static closure rule
+// exposes the latent cycle, both build privately and fall back + warn through
+// the chain-based cycle detection).
+func TestStackMutualReferenceConcurrentNoDeadlock(t *testing.T) {
+	mgr := log.NewFactory(log.Config{
+		Default: "x",
+		Channels: map[string]contracts.Fields{
+			"x": {log.KeyDriver: "stack", log.KeyLevel: "debug", "channels": []string{"y"}},
+			"y": {log.KeyDriver: "stack", log.KeyLevel: "debug", "channels": []string{"x"}},
+		},
+	})
+
+	var xLogger, yLogger contracts.ChannelLogger
+	out := captureStderr(t, func() {
+		start := make(chan struct{})
+		results := make([]contracts.ChannelLogger, 2)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			results[0] = mgr.Channel("x")
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			results[1] = mgr.Channel("y")
+		}()
+		close(start)
+
+		finished := make(chan struct{})
+		go func() { wg.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Error("互引 stack 并发构建死锁 concurrent builds of mutually referencing stacks deadlocked")
+		}
+		xLogger, yLogger = results[0], results[1]
+	})
+
+	assert.NotNil(t, xLogger)
+	assert.NotNil(t, yLogger)
+	assert.Contains(t, out, "循环引用", "潜在环应被识破并兜底告警 the latent cycle must be exposed with a fallback warn")
+}
