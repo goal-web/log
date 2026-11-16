@@ -177,6 +177,27 @@ func TestNewBufferLoggerMinimalValid(t *testing.T) {
 	assert.Contains(t, out, "INFO")
 }
 
+// TestChannelNameInjection 锁定工厂的通道名注入行为：构建通道后对 zap 适配
+// logger 注入 .Named(通道名)，json 格式输出 "channel" 字段，console 格式在
+// 时间与级别之后输出通道名，多通道输出可区分来源。
+// TestChannelNameInjection locks the factory's channel-name injection: the
+// zap-backed logger gets .Named(channel) after build, json output carries the
+// "channel" field and console output emits the name after time and level, so
+// multi-channel output distinguishes its source.
+func TestChannelNameInjection(t *testing.T) {
+	jsonBuf, jsonLogger := newBufferChannel(t, "json")
+	jsonLogger.Info("named-json")
+
+	assert.Contains(t, jsonBuf.String(), `"channel":"test"`)
+	assert.Contains(t, jsonBuf.String(), "named-json")
+
+	consoleBuf, consoleLogger := newBufferChannel(t, "console")
+	consoleLogger.Info("named-console")
+
+	assert.Contains(t, consoleBuf.String(), "\ttest\t")
+	assert.Contains(t, consoleBuf.String(), "named-console")
+}
+
 // TestConcurrentWrites 验证共享同一 logger 并发写不丢消息（需配合 -race 运行以发现数据竞争）。
 // TestConcurrentWrites verifies concurrent writes through a shared logger do not
 // lose messages (run with -race to surface data races).
