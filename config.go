@@ -15,9 +15,11 @@ const (
 	// KeyDefault 是顶层配置中默认通道名的键。
 	// KeyDefault is the top-level key holding the default channel name.
 	KeyDefault = "default"
-	// KeyChannels 是顶层配置中通道表（键为通道名，值为通道配置）的键。
+	// KeyChannels 是顶层配置中通道表（键为通道名，值为通道配置）的键；
+	// 同名键也用于 stack 通道配置中的子通道名列表（[]string 或 []any）。
 	// KeyChannels is the top-level key holding the channel table (channel
-	// name -> channel config).
+	// name -> channel config); the same key holds a stack channel's child-name
+	// list ([]string or []any) inside its channel config.
 	KeyChannels = "channels"
 	// KeyDriver 是通道配置中驱动名的键。
 	// KeyDriver is the channel key holding the driver name.

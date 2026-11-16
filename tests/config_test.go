@@ -11,12 +11,19 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// captureStderr 临时把 os.Stderr 替换为管道写端并执行 fn，返回期间写入
-// stderr 的全部内容；测试结束前恢复原值。兜底 Warn 走 os.Stderr，借此断言。
-// captureStderr temporarily swaps os.Stderr for a pipe write end while fn runs
-// and returns everything written to stderr; the original is restored before
-// the test ends. The fallback Warn goes to os.Stderr, enabling this assertion.
-func captureStderr(t *testing.T, fn func()) string {
+// capturePipe 临时把 *target 指向的标准流替换为管道写端并执行 fn，返回期间
+// 写入的全部内容。恢复与关闭写端/读端均经 t.Cleanup 完成——fn panic 时也
+// 会关闭写端，读取 goroutine 不会泄漏。
+// 注意：本 helper 改写全局 os.Stdout/os.Stderr，与 t.Parallel 不兼容，
+// 使用它的测试不得调用 t.Parallel。
+//
+// capturePipe temporarily swaps the standard stream *target for a pipe write
+// end while fn runs and returns everything written. Restore and closing of
+// both pipe ends happen via t.Cleanup — even if fn panics, the write end is
+// closed so the reader goroutine cannot leak.
+// Note: this helper mutates the global os.Stdout/os.Stderr and is therefore
+// incompatible with t.Parallel; tests using it must not call t.Parallel.
+func capturePipe(t *testing.T, target **os.File, fn func()) string {
 	t.Helper()
 
 	r, w, err := os.Pipe()
@@ -24,9 +31,16 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatalf("os.Pipe 失败 failed: %v", err)
 	}
 
-	original := os.Stderr
-	os.Stderr = w
-	defer func() { os.Stderr = original }()
+	original := *target
+	*target = w
+	t.Cleanup(func() {
+		*target = original
+		// 重复 Close 返回错误，忽略即可；panic 路径下保证读端不悬挂。
+		// A second Close returns an error, which is fine; this guarantees the
+		// read end never hangs on the panic path.
+		_ = w.Close()
+		_ = r.Close()
+	})
 
 	done := make(chan string, 1)
 	go func() {
@@ -38,11 +52,21 @@ func captureStderr(t *testing.T, fn func()) string {
 
 	// 关闭写端使读端 ReadAll 返回。
 	// Close the write end so ReadAll on the read end returns.
-	w.Close()
+	_ = w.Close()
 	out := <-done
-	r.Close()
 
 	return out
+}
+
+// captureStderr 临时把 os.Stderr 替换为管道写端并执行 fn，返回期间写入
+// stderr 的全部内容。兜底 Warn 走 os.Stderr，借此断言。
+// captureStderr temporarily swaps os.Stderr for a pipe write end while fn runs
+// and returns everything written to stderr. The fallback Warn goes to
+// os.Stderr, enabling this assertion.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	return capturePipe(t, &os.Stderr, fn)
 }
 
 // TestZeroConfigFallback 验证全空配置不 panic，工厂返回内置 console/debug 兜底 logger。

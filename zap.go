@@ -20,10 +20,14 @@ import (
 // timeLayout is the time layout shared by the console and json formats.
 const timeLayout = "2006-01-02 15:04:05"
 
-// zapLogger 是 contracts.Logger/ChannelLogger 的 zap 适配实现。
+// zapLogger 是 contracts.Logger/ChannelLogger 的 zap 适配实现。core 保存底层
+// zapcore.Core：stack 组合通道需要它做 NewTee 扇出（与 l 的 Named 注入互不影响）。
 // zapLogger is the zap-backed implementation of contracts.Logger/ChannelLogger.
+// core keeps the underlying zapcore.Core: stack composition needs it for the
+// NewTee fan-out (independent of the Named injection carried by l).
 type zapLogger struct {
-	l *zap.Logger
+	l    *zap.Logger
+	core zapcore.Core
 }
 
 // Debug 在 DEBUG 级别记录日志。
@@ -124,7 +128,10 @@ func withChannelName(logger contracts.Logger, channelName string) contracts.Logg
 		return logger
 	}
 
-	return &zapLogger{l: zl.l.Named(channelName)}
+	// Named 只作用于 zap.Logger（写入 entry），core 原样透传，组合语义不变。
+	// Named only affects the zap.Logger (written into entries); the core passes
+	// through unchanged, keeping composition semantics intact.
+	return &zapLogger{core: zl.core, l: zl.l.Named(channelName)}
 }
 
 // NewBufferLogger 从通道配置构建写入任意 io.Writer 的 logger，
@@ -136,8 +143,14 @@ func withChannelName(logger contracts.Logger, channelName string) contracts.Logg
 //     缺省 debug；字段缺失或值为 nil 走默认，存在但类型错误或值非法时返回 error
 //   - format (string)：console/json，不区分大小写，缺省 console；错误策略同 level
 //
+// level 与 format 的提取委托给 newChannelFromWriter（与内置驱动同一管线），
+// 本函数只负责 writer 提取与并发加锁。
+//
 // NewBufferLogger builds a logger writing to any io.Writer from channel
 // configuration; it is the standard entry point for custom drivers and tests.
+// Level and format extraction are delegated to newChannelFromWriter (the same
+// pipeline as the built-in drivers); this function only handles writer
+// extraction and the concurrency lock.
 func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
 	writerValue, ok := cfg[KeyWriter]
 	if !ok || writerValue == nil {
@@ -147,16 +160,6 @@ func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
 	writer, ok := writerValue.(io.Writer)
 	if !ok {
 		return nil, fmt.Errorf("log: writer 字段需实现 io.Writer，实际类型 %T writer field must implement io.Writer, got %T", writerValue, writerValue)
-	}
-
-	level, err := configString(cfg, KeyLevel)
-	if err != nil {
-		return nil, err
-	}
-
-	format, err := configString(cfg, KeyFormat)
-	if err != nil {
-		return nil, err
 	}
 
 	// bytes.Buffer 等普通 io.Writer 自身不并发安全，需加锁后才能被多 goroutine 共享；
@@ -171,33 +174,16 @@ func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
 		writeSyncer = zapcore.Lock(zapcore.AddSync(writer))
 	}
 
-	return newChannelLogger(writeSyncer, level, format)
-}
-
-// configString 读取字符串配置项：字段缺失或值为 nil 时返回空串（由调用方应用默认值），
-// 字段存在但类型不是 string 时返回 error（与非法字符串值的严格策略保持一致）。
-// configString reads a string config entry: a missing field or nil value yields
-// "" (the caller applies its default), while a present non-string value returns
-// an error, consistent with the strict policy for invalid string values.
-func configString(cfg contracts.Fields, key string) (string, error) {
-	value, ok := cfg[key]
-	if !ok || value == nil {
-		return "", nil
-	}
-
-	str, ok := value.(string)
-	if !ok {
-		return "", fmt.Errorf("log: %s 字段需为字符串，实际类型 %T %s field must be a string, got %T", key, value, key, value)
-	}
-
-	return str, nil
+	return newChannelFromWriter(cfg, writeSyncer)
 }
 
 // newChannelLogger 用给定的写入器、级别与格式组装 zap 通道 logger，
 // 供各内置驱动复用。级别或格式非法时返回 error 而非 panic。
+// 返回值同时携带 core，供 stack 组合通道做 NewTee 扇出。
 // newChannelLogger assembles a zap channel logger from the given writer,
 // level and format, for reuse by the built-in drivers. It returns an error
-// instead of panicking on an invalid level or format.
+// instead of panicking on an invalid level or format. The result carries the
+// core so stack composition can fan out with NewTee.
 func newChannelLogger(writer zapcore.WriteSyncer, levelStr, format string) (*zapLogger, error) {
 	encoder, err := newEncoder(format)
 	if err != nil {
@@ -211,7 +197,7 @@ func newChannelLogger(writer zapcore.WriteSyncer, levelStr, format string) (*zap
 
 	core := zapcore.NewCore(encoder, writer, level)
 
-	return &zapLogger{l: zap.New(core)}, nil
+	return &zapLogger{core: core, l: zap.New(core)}, nil
 }
 
 // newEncoder 按格式构建 zapcore.Encoder（不区分大小写）：json 或 console（缺省）。

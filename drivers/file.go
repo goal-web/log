@@ -12,14 +12,17 @@ import (
 	"time"
 
 	"github.com/goal-web/contracts"
+	"github.com/goal-web/log/internal/configutil"
 	"go.uber.org/zap/zapcore"
 )
 
 // keyPath 是通道配置中日志文件路径的键，与 log 包的 log.KeyPath（"path"）
-// 对应；复刻原因同 keyOutput（子包不能反向引用 log 包）。
+// 对应；复刻原因同 keyOutput（子包不能反向引用 log 包，字符串读取本身用
+// 共享的 internal/configutil）。
 // keyPath is the channel key holding the log file path, mirroring log.KeyPath
 // ("path") in the log package; replicated for the same reason as keyOutput
-// (the subpackage must not import log back).
+// (the subpackage must not import log back; string reading itself uses the
+// shared internal/configutil).
 const keyPath = "path"
 
 // dayFormat 是切分文件名中日期后缀的布局。
@@ -154,7 +157,14 @@ func (w *DailyFileWriter) rotate(day string) error {
 	}
 
 	if w.file != nil {
-		_ = w.file.Close()
+		// 关闭旧句柄：失败不阻断切换（新文件已打开成功），但经 stderr 提示，
+		// 避免 fd 泄漏无声无息（Task 5 审查遗留）。
+		// Closing the old handle: a failure does not block the switch (the new
+		// file is already open) but is surfaced on stderr so the fd leak is not
+		// silent (a Task 5 review leftover).
+		if closeErr := w.file.Close(); closeErr != nil {
+			fmt.Fprintf(os.Stderr, "log: 关闭旧日志文件 %s 失败 failed to close previous log file %s: %v\n", w.file.Name(), w.file.Name(), closeErr)
+		}
 	}
 	w.file = file
 	w.day = day
@@ -174,7 +184,7 @@ func (w *DailyFileWriter) rotate(day string) error {
 // The clock is time.Now. The returned *DailyFileWriter is exposed as a
 // zapcore.WriteSyncer.
 func NewFileWriter(cfg contracts.Fields) (zapcore.WriteSyncer, error) {
-	path, err := configString(cfg, keyPath)
+	path, err := configutil.String(cfg, keyPath)
 	if err != nil {
 		return nil, err
 	}

@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"io"
 	"os"
 	"testing"
 
@@ -12,37 +11,14 @@ import (
 )
 
 // captureStdout 临时把 os.Stdout 替换为管道写端并执行 fn，返回期间写入
-// stdout 的全部内容；测试结束前恢复原值。实现模式与 captureStderr 一致。
+// stdout 的全部内容。实现复用 config_test.go 的 capturePipe（t.Cleanup 收尾）。
 // captureStdout temporarily swaps os.Stdout for a pipe write end while fn runs
-// and returns everything written to stdout; the original is restored before the
-// test ends. It mirrors the captureStderr implementation.
+// and returns everything written to stdout. It reuses capturePipe from
+// config_test.go (cleaned up via t.Cleanup).
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe 失败 failed: %v", err)
-	}
-
-	original := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = original }()
-
-	done := make(chan string, 1)
-	go func() {
-		data, _ := io.ReadAll(r)
-		done <- string(data)
-	}()
-
-	fn()
-
-	// 关闭写端使读端 ReadAll 返回。
-	// Close the write end so ReadAll on the read end returns.
-	w.Close()
-	out := <-done
-	r.Close()
-
-	return out
+	return capturePipe(t, &os.Stdout, fn)
 }
 
 // TestConsoleWriterFromConfig 验证 drivers.NewConsoleWriter 的 output 配置：

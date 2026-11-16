@@ -16,16 +16,18 @@ import (
 	"strings"
 
 	"github.com/goal-web/contracts"
+	"github.com/goal-web/log/internal/configutil"
 	"go.uber.org/zap/zapcore"
 )
 
 // keyOutput 是通道配置中输出通道（stdout/stderr）的键，与 log 包的
-// log.KeyOutput（"output"）对应；drivers 是 log 的子包、不能反向引用，
-// 故在此以私有常量复刻，避免跨包耦合。
+// log.KeyOutput（"output"）对应；drivers 是 log 的子包、不能反向引用 log 包，
+// 故在此以私有常量复刻键名（字符串读取本身用共享的 internal/configutil）。
 // keyOutput is the channel key holding the output stream (stdout/stderr),
 // mirroring log.KeyOutput ("output") in the log package; drivers is a child
-// package that must not import log back, so the key is replicated here as a
-// private constant to avoid cross-package coupling.
+// package that must not import log back, so the key name is replicated here as
+// a private constant (string reading itself uses the shared
+// internal/configutil).
 const keyOutput = "output"
 
 // NewConsoleWriter 从通道配置构建 console 驱动的输出写入器：
@@ -43,7 +45,7 @@ const keyOutput = "output"
 // The returned standard streams are wrapped with zapcore.AddSync: writes to an
 // os.File are process-level serial already, so no extra zapcore.Lock is needed.
 func NewConsoleWriter(cfg contracts.Fields) (zapcore.WriteSyncer, error) {
-	output, err := configString(cfg, keyOutput)
+	output, err := configutil.String(cfg, keyOutput)
 	if err != nil {
 		return nil, err
 	}
@@ -56,25 +58,4 @@ func NewConsoleWriter(cfg contracts.Fields) (zapcore.WriteSyncer, error) {
 	default:
 		return nil, fmt.Errorf("log: 未知的输出通道 %q unknown output stream %q", output, output)
 	}
-}
-
-// configString 读取字符串配置项：字段缺失或值为 nil 时返回空串（由调用方应用
-// 缺省值或必填校验），字段存在但类型不是 string 时返回 error。与 log 包的同名
-// 函数语义一致——复刻同样是出于不能反向引用 log 包的约束。
-// configString reads a string config entry: a missing field or nil value yields
-// "" (the caller applies its default or required check), while a present
-// non-string value returns an error. Semantics match the log package's
-// counterpart — replicated for the same no-back-import constraint.
-func configString(cfg contracts.Fields, key string) (string, error) {
-	value, ok := cfg[key]
-	if !ok || value == nil {
-		return "", nil
-	}
-
-	str, ok := value.(string)
-	if !ok {
-		return "", fmt.Errorf("log: %s 字段需为字符串，实际类型 %T %s field must be a string, got %T", key, value, key, value)
-	}
-
-	return str, nil
 }

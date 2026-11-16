@@ -283,3 +283,105 @@ func TestFactoryFileDriverMissingPathFallsBack(t *testing.T) {
 	assert.Contains(t, out, "WARN")
 	assert.Contains(t, out, "path")
 }
+
+// TestDailyFileWriterCloseThenWriteReopens 验证 Close 后再写的重开语义：
+// Close 清空句柄与日期标记，之后的写入按当日重新建文件并以 O_APPEND 追加，
+// 内容不丢失也不重复建文件。
+// TestDailyFileWriterCloseThenWriteReopens verifies the reopen semantics after
+// Close: the day marker and handle are cleared, so the next write recreates
+// the current day's file and appends via O_APPEND with nothing lost and no
+// duplicate files.
+func TestDailyFileWriterCloseThenWriteReopens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	day := time.Date(2026, 11, 17, 10, 0, 0, 0, time.Local)
+
+	w := drivers.NewDailyFileWriter(path, func() time.Time { return day })
+	_, err := w.Write([]byte("before-close\n"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	_, err = w.Write([]byte("after-close\n"))
+	assert.NoError(t, err)
+
+	files, err := filepath.Glob(filepath.Join(dir, "app-*.log"))
+	assert.NoError(t, err)
+	assert.Len(t, files, 1)
+
+	content, err := os.ReadFile(files[0])
+	assert.NoError(t, err)
+	assert.Equal(t, "before-close\nafter-close\n", string(content))
+}
+
+// TestDailyFileWriterSyncBeforeFirstWrite 验证首写前 Sync 为空操作：不报错、
+// 不建文件。
+// TestDailyFileWriterSyncBeforeFirstWrite verifies Sync before the first write
+// is a no-op: no error and no file created.
+func TestDailyFileWriterSyncBeforeFirstWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	w := drivers.NewDailyFileWriter(filepath.Join(dir, "app.log"), nil)
+	assert.NoError(t, w.Sync(), "首写前 Sync 应为空操作 Sync before the first write must be a no-op")
+
+	files, err := filepath.Glob(filepath.Join(dir, "app-*"))
+	assert.NoError(t, err)
+	assert.Empty(t, files, "Sync 不得触发建文件 Sync must not create the file")
+}
+
+// TestDailyFileWriterRotateFailureKeepsState 验证 rotate 失败时旧状态保留：
+// 收回目录写权限使次日打开文件失败后，旧句柄与日期标记均未被破坏——恢复权限
+// 后重试即成功，旧文件内容原样、新文件从失败处重新开始。
+// TestDailyFileWriterRotateFailureKeepsState verifies the old state survives a
+// failed rotate: after revoking the directory's write permission so the next
+// day's open fails, neither the old handle nor the day marker is damaged —
+// once the permission is restored a retry succeeds, the old file's content is
+// intact and the new file starts fresh after the failure.
+func TestDailyFileWriterRotateFailureKeepsState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	day1 := time.Date(2026, 11, 17, 10, 0, 0, 0, time.Local)
+	day2 := day1.AddDate(0, 0, 1)
+
+	// 可变时钟：首写 day1，之后翻到 day2 触发切分。
+	// Mutable clock: the first write happens on day1, then flips to day2 to
+	// trigger the rotation.
+	current := day1
+	w := drivers.NewDailyFileWriter(path, func() time.Time { return current })
+	_, err := w.Write([]byte("day-one\n"))
+	assert.NoError(t, err)
+
+	// 收回目录写权限：MkdirAll 对已存在目录直接成功，rotate 在 OpenFile 处失败。
+	// Revoke the directory's write permission: MkdirAll succeeds on the existing
+	// directory, so rotate fails at OpenFile.
+	assert.NoError(t, os.Chmod(dir, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) }) // 保证 TempDir 可被清理 keep TempDir removable
+
+	current = day2
+	_, err = w.Write([]byte("day-two-blocked\n"))
+	assert.Error(t, err, "无写权限时次日写入应失败 the next-day write must fail without write permission")
+
+	// 恢复权限后重试：rotate 用保留的旧状态成功切换。
+	// After restoring the permission a retry succeeds: rotate switches using the
+	// preserved old state.
+	assert.NoError(t, os.Chmod(dir, 0o755))
+	_, err = w.Write([]byte("day-two-ok\n"))
+	assert.NoError(t, err)
+
+	// 旧文件原样保留：失败路径既未误标日期（否则 day-two-ok 会写进旧文件），
+	// 也未提前关闭/截断旧句柄。
+	// The old file is intact: the failure path neither mislabeled the day
+	// (otherwise day-two-ok would land in the old file) nor closed/truncated
+	// the old handle early.
+	b1, err := os.ReadFile(filepath.Join(dir, "app-20261117.log"))
+	assert.NoError(t, err)
+	assert.Equal(t, "day-one\n", string(b1))
+
+	// 被阻塞的那条消息不得出现在任何文件中。
+	// The blocked message must not appear in any file.
+	b2, err := os.ReadFile(filepath.Join(dir, "app-20261118.log"))
+	assert.NoError(t, err)
+	assert.Equal(t, "day-two-ok\n", string(b2))
+
+	combined := string(b1) + string(b2)
+	assert.NotContains(t, combined, "day-two-blocked")
+}
