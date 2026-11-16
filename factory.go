@@ -6,16 +6,21 @@ import (
 	"sync"
 
 	"github.com/goal-web/contracts"
+	"github.com/goal-web/log/drivers"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Factory 是 contracts.LogManager 的实现：按名称懒构建通道并缓存，
 // 支持运行时注册自定义驱动，并在零配置或通道缺失时兜底。
-// 完整的内置驱动管线（Task 6）将替换临时的 console 驱动注册。
+// 内置 console/file 驱动的 writer 由 drivers 子包提供，组合在本包完成；
+// 自定义驱动的统一收编（类型守卫等）由 Task 6 处理。
 // Factory is a contracts.LogManager: channels are built lazily by name and
 // cached, custom drivers can be registered at runtime, and missing or empty
-// configurations fall back to a built-in channel. The full built-in driver
-// pipeline (Task 6) will replace the temporary console driver registration.
+// configurations fall back to a built-in channel. Writers of the built-in
+// console/file drivers come from the drivers subpackage while composition
+// happens in this package; unifying custom drivers (type guards etc.) is
+// handled by Task 6.
 type Factory struct {
 	config   Config
 	drivers  map[string]contracts.LogDriver
@@ -50,29 +55,54 @@ func NewFactory(config Config) contracts.LogManager {
 	}
 }
 
-// newBuiltinDrivers 返回内置驱动表。临时实现仅注册 console 驱动，
-// 直接复用兜底通道的构建路径（stderr/console/debug，缺省级别由 configString
-// 解析缺省）；完整驱动管线在 Task 6 落地。
-// newBuiltinDrivers returns the built-in driver table. The temporary
-// implementation registers only the console driver, reusing the fallback
-// channel's build path (stderr/console/debug, with defaults resolved through
-// configString); the full driver pipeline lands in Task 6.
+// newBuiltinDrivers 返回内置驱动表：console（stdout/stderr，output 控制）
+// 与 file（按日切分，path 控制）。drivers 子包只提供 writer（不能反向引用
+// log 包），writer + encoder + level → logger 的组合在此完成；返回的
+// Logger 实际为 ChannelLogger（zap 适配实现），兜底分派见 buildChannel。
+// newBuiltinDrivers returns the built-in driver table: console
+// (stdout/stderr, via output) and file (daily-split, via path). The drivers
+// subpackage provides writers only (it must not import log back), so the
+// writer + encoder + level -> logger composition happens here; the returned
+// Logger is in fact a ChannelLogger (zap-backed), with the fallback dispatch
+// in buildChannel.
 func newBuiltinDrivers() map[string]contracts.LogDriver {
 	return map[string]contracts.LogDriver{
 		"console": func(_ string, cfg contracts.Fields) (contracts.Logger, error) {
-			level, err := configString(cfg, KeyLevel)
+			writer, err := drivers.NewConsoleWriter(cfg)
 			if err != nil {
 				return nil, err
 			}
 
-			format, err := configString(cfg, KeyFormat)
+			return newChannelFromWriter(cfg, writer)
+		},
+		"file": func(_ string, cfg contracts.Fields) (contracts.Logger, error) {
+			writer, err := drivers.NewFileWriter(cfg)
 			if err != nil {
 				return nil, err
 			}
 
-			return newChannelLogger(os.Stderr, level, format)
+			return newChannelFromWriter(cfg, writer)
 		},
 	}
+}
+
+// newChannelFromWriter 用通道配置中的 level 与 format，把 driver 提供的
+// writer 组装为 zap 通道 logger，是内置驱动共用的组合路径。
+// newChannelFromWriter assembles a writer from a driver into a zap channel
+// logger using the level and format from the channel config; it is the shared
+// composition path for the built-in drivers.
+func newChannelFromWriter(cfg contracts.Fields, writer zapcore.WriteSyncer) (contracts.Logger, error) {
+	level, err := configString(cfg, KeyLevel)
+	if err != nil {
+		return nil, err
+	}
+
+	format, err := configString(cfg, KeyFormat)
+	if err != nil {
+		return nil, err
+	}
+
+	return newChannelLogger(writer, level, format)
 }
 
 // Extend 以给定名称注册自定义日志驱动。
@@ -202,8 +232,11 @@ func (l *levelDispatchLogger) Error(msg string) { l.logger.Error(msg) }
 func (l *levelDispatchLogger) Fatal(msg string) { l.logger.Fatal(msg) }
 
 // fallbackChannel 构建兜底 logger（stderr/console/debug），并输出构建失败的原因。
+// 保持 stderr 直连而不过 drivers 包（Task 6 收编兜底路径），确保兜底永不依赖驱动构建成功。
 // fallbackChannel builds the fallback logger (stderr/console/debug) and reports
-// why the original channel failed to build.
+// why the original channel failed to build. It stays wired straight to stderr
+// instead of going through the drivers subpackage (the fallback path is folded
+// in by Task 6), guaranteeing the fallback never depends on a driver building.
 func fallbackChannel(reason error) contracts.ChannelLogger {
 	logger, err := newChannelLogger(os.Stderr, "debug", "console")
 	if err != nil {
