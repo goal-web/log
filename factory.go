@@ -106,8 +106,10 @@ type levelDispatchLogger struct {
 	logger contracts.Logger
 }
 
-// Log 按给定级别分派到 Logger 的对应方法。
-// Log dispatches to the matching Logger method for the given level.
+// Log 按给定级别分派到 Logger 的对应方法；未知级别降级为 Info，
+// 与 zap.go 的 toZapLevel 保持一致的兜底语义。
+// Log dispatches to the matching Logger method for the given level; unknown
+// levels degrade to Info, consistent with toZapLevel in zap.go.
 func (l *levelDispatchLogger) Log(level contracts.LogLevel, msg string) {
 	switch level {
 	case contracts.DebugLevel:
@@ -116,10 +118,12 @@ func (l *levelDispatchLogger) Log(level contracts.LogLevel, msg string) {
 		l.logger.Info(msg)
 	case contracts.WarnLevel:
 		l.logger.Warn(msg)
+	case contracts.ErrorLevel:
+		l.logger.Error(msg)
 	case contracts.FatalLevel:
 		l.logger.Fatal(msg)
 	default:
-		l.logger.Error(msg)
+		l.logger.Info(msg)
 	}
 }
 

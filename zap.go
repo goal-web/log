@@ -115,22 +115,67 @@ func toZapLevel(level contracts.LogLevel) zapcore.Level {
 // NewBufferLogger 从通道配置构建写入任意 io.Writer 的 logger，
 // 是自定义驱动与测试的标准入口。cfg 支持的字段：
 //
-//   - writer (io.Writer)：必填，日志输出目标
-//   - level (string)：debug/info/warn/error/fatal，缺省 debug，非法值返回 error
-//   - format (string)：console/json，缺省 console，未知值返回 error
+//   - writer (io.Writer)：必填，日志输出目标；非 WriteSyncer（如 bytes.Buffer）
+//     会自动加锁，保证可被多个 goroutine 安全共享
+//   - level (string)：debug/info/warn/warning/error/fatal，不区分大小写，
+//     缺省 debug；字段缺失或值为 nil 走默认，存在但类型错误或值非法时返回 error
+//   - format (string)：console/json，不区分大小写，缺省 console；错误策略同 level
 //
 // NewBufferLogger builds a logger writing to any io.Writer from channel
 // configuration; it is the standard entry point for custom drivers and tests.
 func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
-	writer, ok := cfg["writer"].(io.Writer)
-	if !ok || writer == nil {
-		return nil, fmt.Errorf("log: buffer 驱动需要在配置的 writer 字段提供 io.Writer buffer driver requires an io.Writer in the writer field")
+	writerValue, ok := cfg["writer"]
+	if !ok || writerValue == nil {
+		return nil, fmt.Errorf("log: buffer 驱动配置缺少 writer 字段 buffer driver config requires a writer field")
 	}
 
-	level, _ := cfg["level"].(string)
-	format, _ := cfg["format"].(string)
+	writer, ok := writerValue.(io.Writer)
+	if !ok {
+		return nil, fmt.Errorf("log: writer 字段需实现 io.Writer，实际类型 %T writer field must implement io.Writer, got %T", writerValue, writerValue)
+	}
 
-	return newChannelLogger(zapcore.AddSync(writer), level, format)
+	level, err := configString(cfg, "level")
+	if err != nil {
+		return nil, err
+	}
+
+	format, err := configString(cfg, "format")
+	if err != nil {
+		return nil, err
+	}
+
+	// bytes.Buffer 等普通 io.Writer 自身不并发安全，需加锁后才能被多 goroutine 共享；
+	// os.File 等原生 WriteSyncer 原样透传，零额外开销。
+	// Plain io.Writer values (e.g. bytes.Buffer) are not concurrency-safe, so they
+	// are wrapped in a lock before being shared across goroutines; native
+	// WriteSyncer values such as os.File pass through with no extra overhead.
+	var writeSyncer zapcore.WriteSyncer
+	if ws, ok := writer.(zapcore.WriteSyncer); ok {
+		writeSyncer = ws
+	} else {
+		writeSyncer = zapcore.Lock(zapcore.AddSync(writer))
+	}
+
+	return newChannelLogger(writeSyncer, level, format)
+}
+
+// configString 读取字符串配置项：字段缺失或值为 nil 时返回空串（由调用方应用默认值），
+// 字段存在但类型不是 string 时返回 error（与非法字符串值的严格策略保持一致）。
+// configString reads a string config entry: a missing field or nil value yields
+// "" (the caller applies its default), while a present non-string value returns
+// an error, consistent with the strict policy for invalid string values.
+func configString(cfg contracts.Fields, key string) (string, error) {
+	value, ok := cfg[key]
+	if !ok || value == nil {
+		return "", nil
+	}
+
+	str, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("log: %s 字段需为字符串，实际类型 %T %s field must be a string, got %T", key, value, key, value)
+	}
+
+	return str, nil
 }
 
 // newChannelLogger 用给定的写入器、级别与格式组装 zap 通道 logger，
@@ -154,8 +199,9 @@ func newChannelLogger(writer zapcore.WriteSyncer, levelStr, format string) (*zap
 	return &zapLogger{l: zap.New(core)}, nil
 }
 
-// newEncoder 按格式构建 zapcore.Encoder：json 或 console（缺省）。
-// newEncoder builds a zapcore.Encoder for the format: json or console (default).
+// newEncoder 按格式构建 zapcore.Encoder（不区分大小写）：json 或 console（缺省）。
+// newEncoder builds a zapcore.Encoder for the format (case-insensitive):
+// json or console (default).
 func newEncoder(format string) (zapcore.Encoder, error) {
 	switch strings.ToLower(format) {
 	case "json":
@@ -167,8 +213,10 @@ func newEncoder(format string) (zapcore.Encoder, error) {
 	}
 }
 
-// parseLevel 解析级别字符串；空值缺省为 debug，非法值返回 error。
-// parseLevel parses a level string; empty falls back to debug, invalid values return an error.
+// parseLevel 解析级别字符串（不区分大小写，"warning" 作为 "warn" 的别名）；
+// 空值缺省为 debug，非法值返回 error。
+// parseLevel parses a level string (case-insensitive, "warning" accepted as an
+// alias of "warn"); empty falls back to debug, invalid values return an error.
 func parseLevel(levelStr string) (zapcore.Level, error) {
 	switch strings.ToLower(levelStr) {
 	case "", "debug":
