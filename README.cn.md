@@ -194,6 +194,23 @@ logger, err := log.NewBufferLogger(contracts.Fields{
 
 注意：`"stack"` 为保留驱动名——注册同名驱动只会覆盖驱动表条目，构建行为仍走 stack 组合分支。
 
+## 性能
+
+[`tests/benchmark_test.go`](./tests/benchmark_test.go) 在同等工作负载下对比 zap 通道与原 apex/log 包装的单条写日志开销：相同固定消息、1 个字段、Info 级别（两侧级别过滤均放行）。两侧都不写真实终端——zap 通道用 console 编码器写 `io.Discard`，apex 侧走官方 `handlers/text`（console 格式的对应物，含真实格式化）写 `io.Discard`。刻意不用纯 no-op 的 `handlers/discard`：它跳过格式化，测出的就不是「写一条日志」的真实成本。
+
+| 基准                          | ns/op（中位数） | B/op | allocs/op |
+|-------------------------------|---------------:|-----:|----------:|
+| `BenchmarkZapChannel`（zap）  | 769.6          | 1450 | 11        |
+| `BenchmarkApexLogger`（apex） | 730.5          | 960  | 11        |
+
+两条管线同一量级：zap 通道相比 apex `text` handler 每条约多 5% 延迟、约 490 B 内存——这是结构化 console 编码（时间布局、级别、通道名）的代价。数字随硬件与负载变化，仅示意量级；console 编码含格式化成本，生产管线也可选用 `json` 格式。测试环境：Apple M1 Pro（darwin/arm64）、Go 1.25.4、`-count=5` 取中位数。
+
+复现命令：
+
+```bash
+go test ./tests -bench 'BenchmarkZapChannel|BenchmarkApexLogger' -benchmem -run '^$' -count=5
+```
+
 ## 零配置兜底行为
 
 - **空配置**：`NewFactory` 在无默认通道且无通道表时注入内置 `console/debug/console` 通道（名为 `console`），`log.NewFactory(log.Config{}).Channel()` 开箱即用。

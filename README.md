@@ -194,6 +194,23 @@ logger, err := log.NewBufferLogger(contracts.Fields{
 
 Note: `"stack"` is a reserved driver name — registering a driver under it only overwrites the driver-table entry; building still routes through the stack composition branch.
 
+## Performance
+
+[`tests/benchmark_test.go`](./tests/benchmark_test.go) compares the per-record cost of the zap channel against the legacy apex/log wrapper under an identical workload: the same fixed message, one field, Info level (admitted by both level filters). Neither side writes to a real terminal — the zap channel encodes with the console encoder into `io.Discard`, while the apex side runs its official `handlers/text` (the console-format counterpart, with real formatting) into `io.Discard`. The pure no-op `handlers/discard` is deliberately not used: it skips formatting, so it would not measure the real cost of writing a record.
+
+| Benchmark                     | ns/op (median) | B/op | allocs/op |
+|-------------------------------|---------------:|-----:|----------:|
+| `BenchmarkZapChannel` (zap)   | 769.6          | 1450 | 11        |
+| `BenchmarkApexLogger` (apex)  | 730.5          | 960  | 11        |
+
+Both pipelines sit in the same order of magnitude: the zap channel adds roughly 5% latency and ~490 B per record over the apex `text` handler — the price of the structured console encoding (time layout, level, channel name). Numbers vary with hardware and workload and indicate magnitude only; the console encoder includes formatting cost, and the `json` format is available for production pipelines. Environment: Apple M1 Pro (darwin/arm64), Go 1.25.4, medians of `-count=5`.
+
+Reproduce with:
+
+```bash
+go test ./tests -bench 'BenchmarkZapChannel|BenchmarkApexLogger' -benchmem -run '^$' -count=5
+```
+
 ## Zero-Configuration Fallback
 
 - **Empty configuration**: `NewFactory` with no default channel and no channel table injects a built-in `console/debug/console` channel named `console`, so `log.NewFactory(log.Config{}).Channel()` works out of the box.
