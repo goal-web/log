@@ -9,22 +9,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// Config 保存日志组件配置。
-// Config holds the log component configuration.
-type Config struct {
-	// Default 指定默认日志通道。
-	// Default specifies the default log channel.
-	Default string
-	// Channels 包含各通道的配置。
-	// Channels contains per-channel configurations.
-	Channels map[string]contracts.Fields
-}
-
-// Factory 是 contracts.LogManager 的最小实现：按名称懒构建通道并缓存，
-// 支持运行时注册自定义驱动。Task 4/6 将重写为完整版本。
-// Factory is a minimal contracts.LogManager: channels are built lazily by name
-// and cached, with runtime custom driver registration. Task 4/6 will replace
-// this with the full implementation.
+// Factory 是 contracts.LogManager 的实现：按名称懒构建通道并缓存，
+// 支持运行时注册自定义驱动，并在零配置或通道缺失时兜底。
+// 完整的内置驱动管线（Task 6）将替换临时的 console 驱动注册。
+// Factory is a contracts.LogManager: channels are built lazily by name and
+// cached, custom drivers can be registered at runtime, and missing or empty
+// configurations fall back to a built-in channel. The full built-in driver
+// pipeline (Task 6) will replace the temporary console driver registration.
 type Factory struct {
 	config   Config
 	drivers  map[string]contracts.LogDriver
@@ -32,13 +23,55 @@ type Factory struct {
 	mutex    sync.Mutex
 }
 
-// NewFactory 用给定配置创建 LogManager。
-// NewFactory creates a LogManager with the given configuration.
+// NewFactory 用给定配置创建 LogManager。配置完全为空（无默认通道且无通道表）
+// 时注入内置 console/debug 通道，保证开箱即用；通道表可由 ParseConfig 生成。
+// NewFactory creates a LogManager with the given configuration. An entirely
+// empty configuration (no default channel and no channel table) gets the
+// built-in console/debug channel injected so the component works out of the
+// box; the channel table may come from ParseConfig.
 func NewFactory(config Config) contracts.LogManager {
+	if config.Default == "" && len(config.Channels) == 0 {
+		config = Config{
+			Default: "console",
+			Channels: map[string]contracts.Fields{
+				"console": {
+					KeyDriver: "console",
+					KeyLevel:  "debug",
+					KeyFormat: "console",
+				},
+			},
+		}
+	}
+
 	return &Factory{
 		config:   config,
-		drivers:  map[string]contracts.LogDriver{},
+		drivers:  newBuiltinDrivers(),
 		channels: map[string]contracts.ChannelLogger{},
+	}
+}
+
+// newBuiltinDrivers 返回内置驱动表。临时实现仅注册 console 驱动，
+// 直接复用兜底通道的构建路径（stderr/console/debug，缺省级别由 configString
+// 解析缺省）；完整驱动管线在 Task 6 落地。
+// newBuiltinDrivers returns the built-in driver table. The temporary
+// implementation registers only the console driver, reusing the fallback
+// channel's build path (stderr/console/debug, with defaults resolved through
+// configString); the full driver pipeline lands in Task 6.
+func newBuiltinDrivers() map[string]contracts.LogDriver {
+	return map[string]contracts.LogDriver{
+		"console": func(_ string, cfg contracts.Fields) (contracts.Logger, error) {
+			level, err := configString(cfg, KeyLevel)
+			if err != nil {
+				return nil, err
+			}
+
+			format, err := configString(cfg, KeyFormat)
+			if err != nil {
+				return nil, err
+			}
+
+			return newChannelLogger(os.Stderr, level, format)
+		},
 	}
 }
 
@@ -72,32 +105,51 @@ func (f *Factory) Channel(name ...string) contracts.ChannelLogger {
 	return logger
 }
 
-// buildChannel 按通道配置调用注册的驱动；驱动缺失或构建失败时回退到
-// stderr/console/debug 并发出告警，保证应用照常启动。
+// buildChannel 按通道配置调用注册的驱动；通道不存在、驱动缺失或构建失败时
+// 回退到 stderr/console/debug 并通过兜底 logger 发出告警（内容含缺失通道名），
+// 保证应用照常启动。兜底构建直接走 newChannelLogger，不经过 Channel()，
+// 因此不会递归。
 // buildChannel invokes the registered driver with the channel config; on a
-// missing driver or a build error it falls back to stderr/console/debug with a
-// warning so the application still starts.
+// missing channel, a missing driver or a build error it falls back to
+// stderr/console/debug with a warning (containing the missing channel name)
+// emitted through the fallback logger itself, so the application still starts.
+// The fallback builds directly through newChannelLogger without going through
+// Channel(), so it cannot recurse.
 func (f *Factory) buildChannel(channelName string) contracts.ChannelLogger {
-	channelConfig := f.config.Channels[channelName]
-	driverName, _ := channelConfig["driver"].(string)
+	channelConfig, ok := f.config.Channels[channelName]
+	if !ok {
+		return fallbackChannel(fmt.Errorf(
+			"log: 日志通道 %q 未配置 log channel %q is not configured", channelName, channelName,
+		))
+	}
+
+	driverName, _ := channelConfig[KeyDriver].(string)
 
 	driver, ok := f.drivers[driverName]
-	if ok {
-		logger, err := driver(channelName, channelConfig)
-		if err == nil {
-			if channelLogger, ok := logger.(contracts.ChannelLogger); ok {
-				return channelLogger
-			}
+	if !ok {
+		return fallbackChannel(fmt.Errorf(
+			"log: 通道 %q 的驱动 %q 未注册 log channel %q driver %q is not registered",
+			channelName, driverName, channelName, driverName,
+		))
+	}
 
-			// 驱动只实现了 Logger 时，按级别分派包装为 ChannelLogger。
-			// Wrap a plain Logger as ChannelLogger by dispatching on level.
-			return &levelDispatchLogger{logger: logger}
-		}
-
+	logger, err := driver(channelName, channelConfig)
+	if err != nil {
 		return fallbackChannel(err)
 	}
 
-	return fallbackChannel(fmt.Errorf("log: 通道 %q 的驱动 %q 未注册 channel driver not registered", channelName, driverName))
+	// 通道名注入：zap 适配实现写入 encoder 的 channel 键，让多通道输出可区分来源。
+	// Inject the channel name: zap-backed loggers write it to the encoder's
+	// channel key so multi-channel output distinguishes its source.
+	logger = withChannelName(logger, channelName)
+
+	if channelLogger, ok := logger.(contracts.ChannelLogger); ok {
+		return channelLogger
+	}
+
+	// 驱动只实现了 Logger 时，按级别分派包装为 ChannelLogger。
+	// Wrap a plain Logger as ChannelLogger by dispatching on level.
+	return &levelDispatchLogger{logger: logger}
 }
 
 // levelDispatchLogger 将仅实现 Logger 的驱动包装为支持按级别记录的 ChannelLogger。

@@ -112,6 +112,21 @@ func toZapLevel(level contracts.LogLevel) zapcore.Level {
 	}
 }
 
+// withChannelName 为 zap 适配实现注入通道名（写入 encoder 的 channel 键），
+// 非 zap 实现原样返回。工厂构建通道后调用，使多通道输出可区分来源。
+// withChannelName attaches the channel name to a zap-backed logger (written to
+// the encoder's channel key) and returns other Logger implementations
+// unchanged. The factory calls it after building a channel so multi-channel
+// output distinguishes its source.
+func withChannelName(logger contracts.Logger, channelName string) contracts.Logger {
+	zl, ok := logger.(*zapLogger)
+	if !ok {
+		return logger
+	}
+
+	return &zapLogger{l: zl.l.Named(channelName)}
+}
+
 // NewBufferLogger 从通道配置构建写入任意 io.Writer 的 logger，
 // 是自定义驱动与测试的标准入口。cfg 支持的字段：
 //
@@ -124,7 +139,7 @@ func toZapLevel(level contracts.LogLevel) zapcore.Level {
 // NewBufferLogger builds a logger writing to any io.Writer from channel
 // configuration; it is the standard entry point for custom drivers and tests.
 func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
-	writerValue, ok := cfg["writer"]
+	writerValue, ok := cfg[KeyWriter]
 	if !ok || writerValue == nil {
 		return nil, fmt.Errorf("log: buffer 驱动配置缺少 writer 字段 buffer driver config requires a writer field")
 	}
@@ -134,12 +149,12 @@ func NewBufferLogger(cfg contracts.Fields) (contracts.Logger, error) {
 		return nil, fmt.Errorf("log: writer 字段需实现 io.Writer，实际类型 %T writer field must implement io.Writer, got %T", writerValue, writerValue)
 	}
 
-	level, err := configString(cfg, "level")
+	level, err := configString(cfg, KeyLevel)
 	if err != nil {
 		return nil, err
 	}
 
-	format, err := configString(cfg, "format")
+	format, err := configString(cfg, KeyFormat)
 	if err != nil {
 		return nil, err
 	}
