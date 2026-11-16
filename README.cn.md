@@ -2,15 +2,187 @@
 
 Goal-Web 框架的日志组件，基于 [zap](https://github.com/uber-go/zap) 实现多通道日志，采用 Laravel 风格的通道配置。
 
+[English](./README.md)
+
+## 特性
+
+- **内置驱动**：`console`（stdout/stderr）与 `file`（按天切分），外加保留的 `stack` 组合驱动
+- **按天切分**：`path = "storage/logs/app.log"` 落盘为 `app-20261117.log`，一天一个文件，不引入轮转依赖
+- **自定义驱动**：运行时经 `Extend` 注册；`NewBufferLogger` 把日志构建到任意 `io.Writer` 上
+- **零配置兜底**：完全空配置自动生成内置 `console/debug` 通道；任何通道构建失败降级为 `stderr/debug/console` 兜底 logger 并告警
+- **每通道级别过滤**：低于通道级别的日志在格式化前短路，零格式化开销
+- **并发安全构建**：首次构建按 singleflight 合并，stack 通道带静态环检测与死锁防护
+- **Laravel 风格配置**：一个 `[log]` 配置节、命名通道、`stack` 扇出
+
 ## 安装
 
 ```bash
 go get github.com/goal-web/log@latest
 ```
 
-## 使用
+要求 Go >= 1.25.0，依赖 [github.com/goal-web/contracts](https://github.com/goal-web/contracts)（v0.5.7+）与 [zap](https://github.com/uber-go/zap)。
 
-文档完善中。
+## 快速开始
+
+### 配置
+
+```toml
+[log]
+default = "stack"
+
+[log.channels.console]
+driver = "console"             # console | file | stack | 自定义
+level = "debug"                # debug | info | warn | error | fatal
+format = "console"             # console | json
+
+[log.channels.file]
+driver = "file"
+level = "info"
+format = "json"
+path = "storage/logs/app.log"  # 按天切分：app-20261117.log
+
+[log.channels.stack]
+driver = "stack"
+level = "debug"
+channels = ["console", "file"] # 扇出目标
+```
+
+通道首次访问时懒构建并缓存；`stack` 通道经 `zapcore.NewTee` 把同一条日志扇出到所有子通道，自身级别在扇出后统一过滤。
+
+### 容器内使用
+
+注册服务，之后在容器可解析的任意位置依赖注入 `contracts.LogManager`：
+
+```go
+package main
+
+import (
+	"github.com/goal-web/application"
+	"github.com/goal-web/config"
+	"github.com/goal-web/contracts"
+	"github.com/goal-web/log"
+)
+
+func main() {
+	app := application.Default()
+
+	app.RegisterServices(
+		config.NewService(
+			config.NewToml(config.File("env.toml")),
+			map[string]contracts.ConfigProvider{},
+		),
+		log.NewService(),
+	)
+
+	app.Call(func(logger contracts.LogManager) {
+		logger.Channel().WithField("order_id", 1).Info("查询订单") // 默认通道
+		logger.Channel("file").Error("只写文件")
+	})
+}
+```
+
+服务提供者从 `[log]` 配置节（`config.Get("log")`）构建 `"log"` 单例；配置节缺失或形态非法时兜底到内置 console 通道，应用照常启动。
+
+### 独立使用（不经容器）
+
+```go
+factory := log.NewFactory(log.ParseConfig(contracts.Fields{
+	log.KeyDefault: "stack",
+	log.KeyChannels: contracts.Fields{
+		"console": contracts.Fields{
+			log.KeyDriver: "console",
+			log.KeyLevel:  "debug",
+			log.KeyFormat: "console",
+		},
+		"file": contracts.Fields{
+			log.KeyDriver: "file",
+			log.KeyLevel:  "info",
+			log.KeyFormat: "json",
+			log.KeyPath:   "storage/logs/app.log",
+		},
+		"stack": contracts.Fields{
+			log.KeyDriver:   "stack",
+			log.KeyLevel:    "debug",
+			log.KeyChannels: []string{"console", "file"},
+		},
+	},
+}))
+
+factory.Channel().WithField("module", "payment").Info("订单已支付") // stack 扇出
+factory.Channel("console").Warn("只进 console")
+```
+
+两种用法的可运行版本见 [`examples/logging.go`](./examples/logging.go)。
+
+### 输出格式
+
+两种格式共用同一字段集：`time`（`2006-01-02 15:04:05`）、大写 `level`、通道名（`channel` 键）与 `msg`；json 格式编码为单个对象。`Fatal` 写完日志后以状态码 1 退出进程（zap 语义）。
+
+## 自定义驱动
+
+`Extend` 以名称注册驱动，配置里 `driver = "<名称>"` 的通道即可使用；`NewBufferLogger` 是把日志构建到任意 `io.Writer` 的标准入口（普通 writer 自动加锁，可安全共享）：
+
+```go
+factory.Extend("memory", func(channelName string, cfg contracts.Fields) (contracts.Logger, error) {
+	// writer 由驱动提供；level/format 沿用通道配置
+	fields := contracts.Fields{log.KeyWriter: os.Stdout}
+	for key, value := range cfg {
+		fields[key] = value
+	}
+
+	return log.NewBufferLogger(fields)
+})
+```
+
+```toml
+[log.channels.memory]
+driver = "memory"
+level = "info"
+format = "json"
+```
+
+```go
+factory.Channel("memory").Info("走自定义驱动")
+```
+
+`NewBufferLogger` 也常用于测试：
+
+```go
+var buf bytes.Buffer
+logger, err := log.NewBufferLogger(contracts.Fields{
+	log.KeyWriter: &buf,
+	log.KeyLevel:  "debug",
+	log.KeyFormat: "console",
+})
+```
+
+注意：`"stack"` 为保留驱动名——注册同名驱动只会覆盖驱动表条目，构建行为仍走 stack 组合分支。
+
+## 零配置兜底行为
+
+- **空配置**：`NewFactory` 在无默认通道且无通道表时注入内置 `console/debug/console` 通道（名为 `console`），`log.NewFactory(log.Config{}).Channel()` 开箱即用。
+- **通道构建失败**：通道未配置、驱动未注册，或构建失败（级别/格式非法、`path` 缺失、stack 环引用或子通道非 zap 实现）时，返回兜底 logger 而非报错。构建 panic 会撤销登记并以兜底 logger 放行等待方，一次 panic 不会卡死后续请求。兜底走正式 console 管线（stderr、debug 级别），输出中名为 `fallback`，并携带原因 `Warn` 一次（兜底结果进缓存，告警不重复刷屏）。
+
+## 约束说明
+
+1. **`NewFactory` 之后不得再修改传入的 `Config`**——工厂基于该静态快照计算 stack 依赖闭包做并发构建死锁防护，事后改动 `Config.Channels` 不会被感知。
+2. **驱动构建期间不得回调 `LogManager.Channel`**（含间接调用）——回调可能落在一次进行中构建的等待路径上形成互等死锁，且构建内外的环检测都看不见驱动发起的重入。
+3. **`stack` 的重复子通道不去重**——同一子通道的 core 在 tee 中出现多次，同一条日志会重复写入（按配置语义直译的双写）。
+
+## 配置键参考
+
+| TOML 键    | 常量             | 作用范围                 | 取值 / 含义                                              |
+|------------|------------------|--------------------------|----------------------------------------------------------|
+| `default`  | `log.KeyDefault` | `[log]`                  | 默认通道名                                                |
+| `channels` | `log.KeyChannels`| `[log]`；stack 通道      | 通道表；stack 通道的子通道名列表                           |
+| `driver`   | `log.KeyDriver`  | 通道                     | `console`、`file`、`stack` 或自定义驱动名                  |
+| `level`    | `log.KeyLevel`   | 通道                     | `debug`、`info`、`warn`/`warning`、`error`、`fatal`；默认 `debug` |
+| `format`   | `log.KeyFormat`  | 通道                     | `console`（默认）、`json`                                 |
+| `path`     | `log.KeyPath`    | `file` 通道              | 日志原始路径；按天切分为 `前缀-YYYYMMDD.后缀`              |
+| `output`   | `log.KeyOutput`  | `console` 通道           | `stdout`（默认）、`stderr`                                |
+| `writer`   | `log.KeyWriter`  | 仅 `NewBufferLogger`     | `io.Writer`；不是 TOML 键                                 |
+
+`level` 与 `format` 不区分大小写；字段缺失走默认值，存在但非法则导致通道构建失败（见上方兜底行为）。
 
 ## 开源协议
 

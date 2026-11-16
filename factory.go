@@ -1,7 +1,6 @@
 package log
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 
@@ -25,14 +24,6 @@ const driverStack = "stack"
 // Named("fallback") so fallback traffic is distinguishable in multi-channel
 // output.
 const fallbackChannelName = "fallback"
-
-// errDefaultChannelMissing 描述 channels 有但 default 缺失的兜底原因
-// （首次触发时 Warn 一次，结果进缓存不重复刷屏）。
-// errDefaultChannelMissing describes the fallback reason when channels exist
-// but the default is missing (warned once on first use, then cached).
-var errDefaultChannelMissing = errors.New(
-	"log: default 未配置，已使用兜底通道 log default channel is not configured, using the fallback channel",
-)
 
 // Factory 是 contracts.LogManager 的实现：按名称懒构建通道并缓存，
 // 支持运行时注册自定义驱动，并在零配置或通道缺失时兜底。
@@ -59,10 +50,19 @@ type Factory struct {
 
 // NewFactory 用给定配置创建 LogManager。配置完全为空（无默认通道且无通道表）
 // 时注入内置 console/debug 通道，保证开箱即用；通道表可由 ParseConfig 生成。
+//
+// 调用方传入 Config 后不得再修改它（尤其是 Channels map）：工厂据此静态快照
+// 计算 stack 依赖闭包做并发构建的死锁防护，事后改动不会被感知。
+//
 // NewFactory creates a LogManager with the given configuration. An entirely
 // empty configuration (no default channel and no channel table) gets the
 // built-in console/debug channel injected so the component works out of the
 // box; the channel table may come from ParseConfig.
+//
+// The caller must not mutate the passed Config after NewFactory returns (its
+// Channels map in particular): the factory computes the static stack
+// dependency closure from this snapshot for concurrent-build deadlock
+// protection, and later mutations go unnoticed.
 func NewFactory(config Config) contracts.LogManager {
 	if config.Default == "" && len(config.Channels) == 0 {
 		config = Config{
