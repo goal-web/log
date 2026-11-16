@@ -47,10 +47,26 @@ func (provider serviceProvider) Start() error {
 
 // Register 在容器中注册 "log" 单例：配置节缺失或形态非法时 ParseConfig 交给
 // NewFactory 兜底，保证开箱即用；单例可在构建后经 Extend 注册自定义驱动。
+//
+// config.Get("log") 的期望形态为 log.Config（强类型直通）或 contracts.Fields
+// （与 TOML [log] 节同构），其余形态走零配置兜底。注意 config 组件把 env.toml
+// 压平为点分键存储，容器里的 "log" 键必须由 goal 骨架的 ConfigProvider 注册
+// （参照 goal/config/cache.go 的 init() 模式）；只在 env.toml 写 [log] 节而未
+// 注册 provider 时 config.Get("log") 为 nil，静默走零配置兜底。
+//
 // Register registers the "log" singleton in the container: a missing or
 // malformed config section is left to NewFactory's fallback through
 // ParseConfig, so the component works out of the box; the singleton accepts
 // custom drivers via Extend after construction.
+//
+// config.Get("log") is expected to be a log.Config (strongly-typed
+// passthrough) or contracts.Fields (mirroring the TOML [log] section); any
+// other shape takes the zero-config fallback. Note that the config component
+// flattens env.toml into dot-separated keys, so the container's "log" key must
+// be registered by the goal skeleton's ConfigProvider (cf. the init() pattern
+// in goal/config/cache.go); writing only a [log] section in env.toml without a
+// provider leaves config.Get("log") nil and silently takes the zero-config
+// fallback.
 func (provider serviceProvider) Register(container contracts.Application) {
 	container.Singleton("log", func(config contracts.Config) contracts.LogManager {
 		return NewFactory(ParseConfig(config.Get("log")))

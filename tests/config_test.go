@@ -104,6 +104,32 @@ func TestParseConfigInvalidRaw(t *testing.T) {
 	assert.Equal(t, log.Config{}, log.ParseConfig(123))
 }
 
+// TestParseConfigPassthrough 验证传入强类型 Config 时原样直通返回（goal 骨架
+// ConfigProvider 的惯例返回形态，参照 goal/config/cache.go 返回 cache.Config），
+// 不经 Fields 解析，也不复制内部 map。
+// TestParseConfigPassthrough verifies a strongly-typed Config is returned
+// as-is (the customary return shape of the goal skeleton's ConfigProvider,
+// cf. goal/config/cache.go returning cache.Config), without the Fields
+// parsing path and without copying the inner map.
+func TestParseConfigPassthrough(t *testing.T) {
+	channels := map[string]contracts.Fields{
+		"file": {log.KeyDriver: "file", log.KeyLevel: "info"},
+	}
+
+	cfg := log.ParseConfig(log.Config{Default: "file", Channels: channels})
+
+	assert.Equal(t, "file", cfg.Default)
+	assert.Len(t, cfg.Channels, 1)
+	assert.Equal(t, "info", cfg.Channels["file"][log.KeyLevel])
+	// 直通共享同一 Channels map（与 Fields 路径存引用的语义一致，零拷贝）：
+	// 经返回值写入的键在原 map 可见。
+	// Passthrough shares the same Channels map (consistent with the Fields
+	// path storing references — zero copy): keys written through the result
+	// are visible in the original map.
+	cfg.Channels["passthrough"] = contracts.Fields{log.KeyDriver: "console"}
+	assert.Contains(t, channels, "passthrough")
+}
+
 // TestParseConfigChannelsWrongType 验证 channels 键存在但类型错误时按缺失处理。
 // TestParseConfigChannelsWrongType verifies a mistyped channels key is treated as missing.
 func TestParseConfigChannelsWrongType(t *testing.T) {

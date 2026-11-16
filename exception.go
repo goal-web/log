@@ -26,9 +26,12 @@ import (
 )
 
 // errDefaultChannelMissing 描述 channels 有但 default 缺失的兜底原因
-// （首次触发时 Warn 一次，结果进缓存不重复刷屏）。
+// （首次触发时 Warn 一次，结果进缓存不重复刷屏）。文案即契约：双语内容同时
+// 是运行时输出与测试断言的固定文本，不可随意改写。
 // errDefaultChannelMissing describes the fallback reason when channels exist
-// but the default is missing (warned once on first use, then cached).
+// but the default is missing (warned once on first use, then cached). The
+// message text is a contract: its bilingual content is both the runtime output
+// and the fixed text asserted by tests, and must not be reworded freely.
 var errDefaultChannelMissing = errors.New(
 	"log: default 未配置，已使用兜底通道 log default channel is not configured, using the fallback channel",
 )

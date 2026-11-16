@@ -16,18 +16,19 @@ import (
 	"github.com/goal-web/log"
 )
 
-// NewManager 演示不经容器直接使用：ParseConfig 解析原始配置（contracts.Fields，
-// 与 TOML [log] 节同构），NewFactory 创建 LogManager。配置为 console + file +
-// stack 三通道，stack 经 zapcore.NewTee 把同一条日志扇出到 console 与 file。
-// 配置完全为空时 NewFactory 自动注入内置 console/debug 通道兜底。
+// StandaloneUsage 演示不经容器直接使用：ParseConfig 解析原始配置
+// （contracts.Fields，与 TOML [log] 节同构），NewFactory 创建 LogManager。
+// 配置为 console + file + stack 三通道，stack 经 zapcore.NewTee 把同一条日志
+// 扇出到 console 与 file。配置完全为空时 NewFactory 自动注入内置
+// console/debug 通道兜底。
 //
-// NewManager demonstrates standalone usage without a container: ParseConfig
-// parses the raw configuration (contracts.Fields, shaped like the TOML [log]
-// section) and NewFactory creates the LogManager. The configuration is the
-// console + file + stack trio; stack fans one record out to console and file
-// via zapcore.NewTee. An entirely empty configuration gets the built-in
-// console/debug channel injected as the fallback.
-func NewManager() contracts.LogManager {
+// StandaloneUsage demonstrates standalone usage without a container:
+// ParseConfig parses the raw configuration (contracts.Fields, shaped like the
+// TOML [log] section) and NewFactory creates the LogManager. The
+// configuration is the console + file + stack trio; stack fans one record out
+// to console and file via zapcore.NewTee. An entirely empty configuration
+// gets the built-in console/debug channel injected as the fallback.
+func StandaloneUsage() contracts.LogManager {
 	factory := log.NewFactory(log.ParseConfig(contracts.Fields{
 		log.KeyDefault: "stack",
 		log.KeyChannels: contracts.Fields{

@@ -47,11 +47,11 @@ level = "debug"
 channels = ["console", "file"] # fan-out targets
 ```
 
-Channels are built lazily on first use and cached; a `stack` channel fans one record out to all of its child channels with `zapcore.NewTee` and applies its own level uniformly after the fan-out.
+Channels are built lazily on first use and cached; a `stack` channel fans one record out to all of its child channels with `zapcore.NewTee` and applies its own level uniformly after the fan-out. The `[log]` section above shows the configuration model; in the container path it reaches the component through a registered config provider — see the wiring note in the next section.
 
 ### Inside the Goal-Web container
 
-Register the service, then depend on `contracts.LogManager` anywhere the container resolves:
+Register the service, then depend on `contracts.LogManager` anywhere the container resolves. The `"log"` key must be present in the config providers (wiring note below) — otherwise `config.Get("log")` is nil and the component silently takes its zero-config fallback:
 
 ```go
 package main
@@ -69,7 +69,19 @@ func main() {
 	app.RegisterServices(
 		config.NewService(
 			config.NewToml(config.File("env.toml")),
-			map[string]contracts.ConfigProvider{},
+			map[string]contracts.ConfigProvider{
+				"log": func(env contracts.Env) any {
+					// same shape as the [log] TOML section above
+					return contracts.Fields{
+						"default": "stack",
+						"channels": contracts.Fields{
+							"console": contracts.Fields{"driver": "console", "level": "debug", "format": "console"},
+							"file":    contracts.Fields{"driver": "file", "level": "info", "format": "json", "path": "storage/logs/app.log"},
+							"stack":   contracts.Fields{"driver": "stack", "level": "debug", "channels": []string{"console", "file"}},
+						},
+					}
+				},
+			},
 		),
 		log.NewService(),
 	)
@@ -81,7 +93,31 @@ func main() {
 }
 ```
 
-The service provider binds the `"log"` singleton from the `[log]` config section (`config.Get("log")`); a missing or malformed section falls back to the built-in console channel, so the application always starts.
+The service provider binds the `"log"` singleton from `config.Get("log")`; a missing or malformed value falls back to the built-in console channel, so the application always starts.
+
+#### Why the provider registration is required
+
+The config component flattens `env.toml` into dot-separated keys (`log.default`, `log.channels.console.driver`, …), while `config.Get("log")` looks up the exact key `"log"`. Writing only a `[log]` section in `env.toml` — without registering the `"log"` provider — leaves `config.Get("log")` nil: the component silently takes the zero-config fallback (console/debug) and the `file`/`stack` channels never come into effect, without any warning.
+
+The goal skeleton registers config providers once via the `init()` pattern (see `goal/config/cache.go`); a `log` provider follows the same shape and may return either the `contracts.Fields` above or a strongly-typed `log.Config`, which `ParseConfig` passes through as-is:
+
+```go
+// goal/config/log.go — the init() pattern used across goal/config/*.go
+func init() {
+	configs["log"] = func(env contracts.Env) any {
+		return log.Config{
+			Default: "stack",
+			Channels: map[string]contracts.Fields{
+				"console": {log.KeyDriver: "console", log.KeyLevel: "debug", log.KeyFormat: "console"},
+				"file":    {log.KeyDriver: "file", log.KeyLevel: "info", log.KeyFormat: "json", log.KeyPath: "storage/logs/app.log"},
+				"stack":   {log.KeyDriver: "stack", log.KeyLevel: "debug", log.KeyChannels: []string{"console", "file"}},
+			},
+		}
+	}
+}
+```
+
+Values may equally be sourced from the environment (`env.GetString(...)`), as `goal/config/cache.go` does. `ParseConfig` accepts exactly two shapes: `log.Config` (strongly-typed passthrough) and `contracts.Fields` (mirroring the TOML `[log]` section); anything else takes the zero-config fallback.
 
 ### Standalone usage (no container)
 
@@ -112,7 +148,7 @@ factory.Channel().WithField("module", "payment").Info("order paid") // stack fan
 factory.Channel("console").Warn("console only")
 ```
 
-A runnable version of both usages lives in [`examples/logging.go`](./examples/logging.go).
+A runnable version of the standalone usage lives in [`examples/logging.go`](./examples/logging.go) (`StandaloneUsage`, plus `RegisterCustomDriver` for the custom-driver flow).
 
 ### Output formats
 
@@ -174,7 +210,7 @@ Note: `"stack"` is a reserved driver name — registering a driver under it only
 | TOML key   | Constant         | Scope                    | Values / meaning                                             |
 |------------|------------------|--------------------------|--------------------------------------------------------------|
 | `default`  | `log.KeyDefault` | `[log]`                  | default channel name                                          |
-| `channels` | `log.KeyChannels`| `[log]`; stack channel   | channel table; a stack channel's child-name list              |
+| `channels` | `log.KeyChannels` | `[log]`; stack channel   | channel table; a stack channel's child-name list              |
 | `driver`   | `log.KeyDriver`  | channel                  | `console`, `file`, `stack`, or a custom driver name           |
 | `level`    | `log.KeyLevel`   | channel                  | `debug`, `info`, `warn`/`warning`, `error`, `fatal`; default `debug` |
 | `format`   | `log.KeyFormat`  | channel                  | `console` (default), `json`                                   |
@@ -182,7 +218,7 @@ Note: `"stack"` is a reserved driver name — registering a driver under it only
 | `output`   | `log.KeyOutput`  | `console` channel        | `stdout` (default), `stderr`                                  |
 | `writer`   | `log.KeyWriter`  | `NewBufferLogger` only   | `io.Writer`; not a TOML key                                   |
 
-`level` and `format` are case-insensitive; a missing field takes its default, while a present-but-invalid one fails the channel build (see the fallback behavior above).
+`level` and `format` are case-insensitive; a missing field takes its default, while a present-but-invalid one fails the channel build (see the fallback behavior above). Where this table and the godoc disagree, the godoc wins.
 
 ## License
 

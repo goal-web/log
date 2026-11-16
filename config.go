@@ -52,52 +52,72 @@ type Config struct {
 	Channels map[string]contracts.Fields
 }
 
-// ParseConfig 将任意原始配置解析为 Config。
+// ParseConfig 将任意原始配置解析为 Config。接受两种合法形态：
+//   - log.Config：强类型直通，原样返回（goal 骨架的 ConfigProvider 惯例返回
+//     结构体，参照 goal/config/cache.go 返回 cache.Config）；不复制内部 map，
+//     返回后同样不得再改动（见 NewFactory 的约束说明）；
+//   - contracts.Fields：与 TOML [log] 节同构的原始形态，按下列规则解析。
 //
-// 解析规则：
-//   - raw 不是 contracts.Fields（含 nil）：返回零配置，由工厂应用兜底；
+// Fields 形态的解析规则：
 //   - default 键缺失或值不是 string：Default 保持空串；
 //   - channels 键缺失或类型不是 contracts.Fields：视为缺失，返回空 map；
 //   - 单个通道条目类型不是 contracts.Fields：跳过该条目，不影响其余通道。
 //
+// 其余形态（含 nil）返回零配置，由工厂应用兜底。
 // ParseConfig 不注入兜底配置——零配置兜底是工厂（NewFactory）的职责。
 //
-// ParseConfig parses arbitrary raw configuration into a Config:
-//   - raw not being contracts.Fields (including nil) yields the zero Config,
-//     leaving fallback handling to the factory;
+// ParseConfig parses arbitrary raw configuration into a Config. Two shapes
+// are accepted:
+//   - log.Config: strongly-typed passthrough, returned as-is (the customary
+//     return shape of the goal skeleton's ConfigProvider, cf.
+//     goal/config/cache.go returning cache.Config); inner maps are not
+//     copied and must not be mutated afterwards either (see NewFactory);
+//   - contracts.Fields: the raw shape mirroring the TOML [log] section,
+//     parsed per the rules below.
+//
+// Parsing rules for the Fields shape:
 //   - a missing or non-string default key leaves Default empty;
 //   - a missing or mistyped channels key is treated as missing (empty map);
 //   - a channel entry that is not contracts.Fields is skipped without
 //     affecting the other channels.
 //
-// ParseConfig never injects fallbacks itself — zero-config fallback is the
-// factory's (NewFactory) responsibility.
+// Any other shape (including nil) yields the zero Config, leaving fallback
+// handling to the factory. ParseConfig never injects fallbacks itself —
+// zero-config fallback is the factory's (NewFactory) responsibility.
 func ParseConfig(raw any) Config {
-	fields, ok := raw.(contracts.Fields)
-	if !ok {
+	switch value := raw.(type) {
+	case Config:
+		// 强类型直通：与 Fields 路径存引用的语义一致，共享内部 map 不拷贝；
+		// 调用方后续同样不得改动（工厂据此静态快照计算 stack 闭包）。
+		// Strongly-typed passthrough: consistent with the Fields path storing
+		// references, inner maps are shared un-copied; the caller must not
+		// mutate them afterwards either (the factory computes its static stack
+		// closure from this snapshot).
+		return value
+	case contracts.Fields:
+		config := Config{
+			Channels: map[string]contracts.Fields{},
+		}
+
+		if defaultName, ok := value[KeyDefault].(string); ok {
+			config.Default = defaultName
+		}
+
+		channels, ok := value[KeyChannels].(contracts.Fields)
+		if !ok {
+			return config
+		}
+
+		for name, rawChannel := range channels {
+			channelConfig, ok := rawChannel.(contracts.Fields)
+			if !ok {
+				continue
+			}
+			config.Channels[name] = channelConfig
+		}
+
+		return config
+	default:
 		return Config{}
 	}
-
-	config := Config{
-		Channels: map[string]contracts.Fields{},
-	}
-
-	if defaultName, ok := fields[KeyDefault].(string); ok {
-		config.Default = defaultName
-	}
-
-	channels, ok := fields[KeyChannels].(contracts.Fields)
-	if !ok {
-		return config
-	}
-
-	for name, rawChannel := range channels {
-		channelConfig, ok := rawChannel.(contracts.Fields)
-		if !ok {
-			continue
-		}
-		config.Channels[name] = channelConfig
-	}
-
-	return config
 }

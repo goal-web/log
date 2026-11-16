@@ -47,11 +47,11 @@ level = "debug"
 channels = ["console", "file"] # 扇出目标
 ```
 
-通道首次访问时懒构建并缓存；`stack` 通道经 `zapcore.NewTee` 把同一条日志扇出到所有子通道，自身级别在扇出后统一过滤。
+通道首次访问时懒构建并缓存；`stack` 通道经 `zapcore.NewTee` 把同一条日志扇出到所有子通道，自身级别在扇出后统一过滤。上面的 `[log]` 节展示的是配置模型；容器路径下它需要经注册的 config provider 才能到达组件——见下一节的接线说明。
 
 ### 容器内使用
 
-注册服务，之后在容器可解析的任意位置依赖注入 `contracts.LogManager`：
+注册服务，之后在容器可解析的任意位置依赖注入 `contracts.LogManager`。config providers 里必须有 `"log"` 键（接线说明见下方），否则 `config.Get("log")` 为 nil，组件静默走零配置兜底：
 
 ```go
 package main
@@ -69,7 +69,19 @@ func main() {
 	app.RegisterServices(
 		config.NewService(
 			config.NewToml(config.File("env.toml")),
-			map[string]contracts.ConfigProvider{},
+			map[string]contracts.ConfigProvider{
+				"log": func(env contracts.Env) any {
+					// 与上方 [log] TOML 节同构
+					return contracts.Fields{
+						"default": "stack",
+						"channels": contracts.Fields{
+							"console": contracts.Fields{"driver": "console", "level": "debug", "format": "console"},
+							"file":    contracts.Fields{"driver": "file", "level": "info", "format": "json", "path": "storage/logs/app.log"},
+							"stack":   contracts.Fields{"driver": "stack", "level": "debug", "channels": []string{"console", "file"}},
+						},
+					}
+				},
+			},
 		),
 		log.NewService(),
 	)
@@ -81,7 +93,31 @@ func main() {
 }
 ```
 
-服务提供者从 `[log]` 配置节（`config.Get("log")`）构建 `"log"` 单例；配置节缺失或形态非法时兜底到内置 console 通道，应用照常启动。
+服务提供者从 `config.Get("log")` 构建 `"log"` 单例；取值为空或形态非法时兜底到内置 console 通道，应用照常启动。
+
+#### 为什么必须注册 provider
+
+config 组件把 env.toml 压平为点分键存储（`log.default`、`log.channels.console.driver`、……），而 `config.Get("log")` 查的是精确键 `"log"`。只在 env.toml 写 `[log]` 节而不注册 `"log"` provider 时，`config.Get("log")` 为 nil：组件静默走零配置兜底（console/debug），`file`/`stack` 通道完全不生效，且没有任何警告。
+
+goal 骨架经 `init()` 模式统一注册 config provider（见 `goal/config/cache.go`）；log provider 照同样形态注册，返回值可以是上面的 `contracts.Fields`，也可以是强类型 `log.Config`（`ParseConfig` 原样直通）：
+
+```go
+// goal/config/log.go —— goal/config/*.go 通用的 init() 注册模式
+func init() {
+	configs["log"] = func(env contracts.Env) any {
+		return log.Config{
+			Default: "stack",
+			Channels: map[string]contracts.Fields{
+				"console": {log.KeyDriver: "console", log.KeyLevel: "debug", log.KeyFormat: "console"},
+				"file":    {log.KeyDriver: "file", log.KeyLevel: "info", log.KeyFormat: "json", log.KeyPath: "storage/logs/app.log"},
+				"stack":   {log.KeyDriver: "stack", log.KeyLevel: "debug", log.KeyChannels: []string{"console", "file"}},
+			},
+		}
+	}
+}
+```
+
+取值同样可以来自环境变量（`env.GetString(...)`），如 `goal/config/cache.go` 的做法。`ParseConfig` 只接受两种形态：`log.Config`（强类型直通）与 `contracts.Fields`（与 TOML `[log]` 节同构）；其余形态走零配置兜底。
 
 ### 独立使用（不经容器）
 
@@ -112,7 +148,7 @@ factory.Channel().WithField("module", "payment").Info("订单已支付") // stac
 factory.Channel("console").Warn("只进 console")
 ```
 
-两种用法的可运行版本见 [`examples/logging.go`](./examples/logging.go)。
+独立用法的可运行版本见 [`examples/logging.go`](./examples/logging.go)（`StandaloneUsage`，自定义驱动流程见 `RegisterCustomDriver`）。
 
 ### 输出格式
 
@@ -174,7 +210,7 @@ logger, err := log.NewBufferLogger(contracts.Fields{
 | TOML 键    | 常量             | 作用范围                 | 取值 / 含义                                              |
 |------------|------------------|--------------------------|----------------------------------------------------------|
 | `default`  | `log.KeyDefault` | `[log]`                  | 默认通道名                                                |
-| `channels` | `log.KeyChannels`| `[log]`；stack 通道      | 通道表；stack 通道的子通道名列表                           |
+| `channels` | `log.KeyChannels` | `[log]`；stack 通道      | 通道表；stack 通道的子通道名列表                           |
 | `driver`   | `log.KeyDriver`  | 通道                     | `console`、`file`、`stack` 或自定义驱动名                  |
 | `level`    | `log.KeyLevel`   | 通道                     | `debug`、`info`、`warn`/`warning`、`error`、`fatal`；默认 `debug` |
 | `format`   | `log.KeyFormat`  | 通道                     | `console`（默认）、`json`                                 |
@@ -182,7 +218,7 @@ logger, err := log.NewBufferLogger(contracts.Fields{
 | `output`   | `log.KeyOutput`  | `console` 通道           | `stdout`（默认）、`stderr`                                |
 | `writer`   | `log.KeyWriter`  | 仅 `NewBufferLogger`     | `io.Writer`；不是 TOML 键                                 |
 
-`level` 与 `format` 不区分大小写；字段缺失走默认值，存在但非法则导致通道构建失败（见上方兜底行为）。
+`level` 与 `format` 不区分大小写；字段缺失走默认值，存在但非法则导致通道构建失败（见上方兜底行为）。本表与 godoc 不一致时，以 godoc 为准。
 
 ## 开源协议
 
